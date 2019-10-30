@@ -7,8 +7,10 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"os"
@@ -38,7 +40,8 @@ type Config struct {
 var logger service.Logger
 
 type program struct {
-	service service.Service
+	service      service.Service
+	logTimeCache *logTimeCache
 
 	*Config
 
@@ -62,11 +65,28 @@ func (p *program) Start(s service.Service) error {
 }
 func (p *program) run() {
 	logger.Info("Starting ", p.DisplayName)
+	if p.Stdout.Filename != "" || p.Stderr.Filename != "" {
+		p.logTimeCache = NewLogTimeCache(logTimeFormatUTC)
+	}
 	if p.Stdout.Filename != "" {
-		p.cmd.Stdout = &p.Stdout
+		r, err := p.cmd.StdoutPipe()
+		if err != nil {
+			logger.Errorf("Error in %s: %s", p.DisplayName, err)
+			return
+		}
+		go func() {
+			pipeOutputToLog(&p.Stdout, r, p.logTimeCache)
+		}()
 	}
 	if p.Stderr.Filename != "" {
-		p.cmd.Stderr = &p.Stderr
+		r, err := p.cmd.StderrPipe()
+		if err != nil {
+			logger.Errorf("Error in %s: %s", p.DisplayName, err)
+			return
+		}
+		go func() {
+			pipeOutputToLog(&p.Stderr, r, p.logTimeCache)
+		}()
 	}
 
 	err := p.cmd.Start()
@@ -76,11 +96,34 @@ func (p *program) run() {
 
 	return
 }
+
+func pipeOutputToLog(w io.WriteCloser, r io.ReadCloser, c *logTimeCache) error {
+	s := bufio.NewScanner(r)
+	for s.Scan() {
+		var b []byte
+		b = c.AppendTime(b)
+		b = append(b, ' ')
+		b = append(b, s.Bytes()...)
+		b = append(b, '\n')
+		_, err := w.Write(b)
+		if err != nil {
+			return err
+		}
+	}
+	if err := s.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (p *program) Stop(s service.Service) error {
 	logger.Info("Stopping ", p.DisplayName)
 	err := p.cmd.Process.Kill()
 	if err != nil {
 		return err
+	}
+	if p.logTimeCache != nil {
+		p.logTimeCache.Stop()
 	}
 	if service.Interactive() {
 		os.Exit(0)
